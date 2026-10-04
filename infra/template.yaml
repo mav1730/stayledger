@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: StayLedger. One EC2 API and one private RDS Postgres instance in the default VPC. No NAT gateway and no load balancer.
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 key pair, used for SSH on port 22.
+  MyIp:
+    Type: String
+    AllowedPattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}/32$"
+    Description: Your public IP as CIDR, for SSH only. Example 203.0.113.10/32.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetA:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet for the API instance. Also used by RDS.
+  SubnetB:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second subnet in a different AZ. RDS requires two.
+  DbPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 20
+    MaxLength: 40
+    AllowedPattern: "[A-Za-z0-9]+"
+    Description: RDS master password. The deploy script stores the same value in SSM.
+  ApiKey:
+    Type: String
+    NoEcho: true
+    Default: stayledger-demo-key
+    AllowedPattern: "[A-Za-z0-9-]+"
+  EngineVersion:
+    Type: String
+    Default: "16.8"
+
+Resources:
+  ApiSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: StayLedger API. HTTP is public. SSH is your IP only.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MyIp
+      Tags:
+        - Key: Name
+          Value: stayledger-api
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: StayLedger Postgres. Only the API security group may connect.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ApiSecurityGroup
+      Tags:
+        - Key: Name
+          Value: stayledger-db
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: StayLedger default-VPC subnets
+      SubnetIds:
+        - !Ref SubnetA
+        - !Ref SubnetB
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: stayledger
+      Engine: postgres
+      EngineVersion: !Ref EngineVersion
+      DBInstanceClass: db.t4g.micro
+      AllocatedStorage: 20
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: stayledger
+      MasterUsername: stayledger
+      MasterUserPassword: !Ref DbPassword
+      VPCSecurityGroups:
+        - !Ref DbSecurityGroup
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: stayledger
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: read-db-password
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/stayledger/db-password
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub ssm.${AWS::Region}.amazonaws.com
+
+  ApiInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ApiRole
+
+  ApiInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: Database
+    Properties:
+      InstanceType: t3.micro
+      ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref ApiInstanceProfile
+      SubnetId: !Ref SubnetA
+      SecurityGroupIds:
+        - !Ref ApiSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 16
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -euxo pipefail
+            exec > /var/log/stayledger-bootstrap.log 2>&1
+            dnf install -y git tar xz
+            curl -fsSL https://nodejs.org/dist/v20.19.0/node-v20.19.0-linux-x64.tar.xz -o /tmp/node.tar.xz
+            tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1
+            if [ ! -d /opt/stayledger/.git ]; then
+              git clone https://github.com/mav1730/stayledger.git /opt/stayledger
+            fi
+            cd /opt/stayledger
+            npm ci --omit=dev
+            DB_PASSWORD=$(aws ssm get-parameter --name /stayledger/db-password --with-decryption --region ${AWS::Region} --query Parameter.Value --output text)
+            cat > /opt/stayledger/.env <<EOF
+            DATABASE_URL=postgres://stayledger:${!DB_PASSWORD}@${DbHost}:5432/stayledger
+            API_KEY=${ApiKey}
+            PORT=80
+            EOF
+            chmod 600 /opt/stayledger/.env
+            node src/migrate.js
+            node src/seed.js
+            cat > /etc/systemd/system/stayledger.service <<'UNIT'
+            [Unit]
+            Description=StayLedger API
+            After=network.target
+
+            [Service]
+            WorkingDirectory=/opt/stayledger
+            EnvironmentFile=/opt/stayledger/.env
+            ExecStart=/usr/local/bin/node src/server.js
+            Restart=on-failure
+            RestartSec=5
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            systemctl daemon-reload
+            systemctl enable --now stayledger
+          - DbHost: !GetAtt Database.Endpoint.Address
+            ApiKey: !Ref ApiKey
+      Tags:
+        - Key: Name
+          Value: stayledger-api
+
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: stayledger
+
+  ElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ElasticIp.AllocationId
+      InstanceId: !Ref ApiInstance
+
+Outputs:
+  ApiUrl:
+    Value: !Sub http://${ElasticIp}/health
+  DbEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  StackNote:
+    Value: HTTP on port 80. No load balancer. Postgres is private. User-data runs once, on first boot.
